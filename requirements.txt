@@ -1,0 +1,11 @@
+kivy==2.3.1
+vosk==0.3.45
+wordfreq==3.1.1
+ebooklib==0.20
+beautifulsoup4==4.14.3
+lxml==6.0.2
+tqdm==4.67.3
+websockets==16.0
+srt==3.5.3
+# Optional for desktop microphone support
+pyaudio>=0.2.14 ; platform_system != "Android" and platform_system != "iOS"
