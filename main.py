@@ -8,6 +8,8 @@ import heapq
 import shutil
 import tempfile
 import requests
+import logging
+import sys
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -17,6 +19,7 @@ from difflib import SequenceMatcher
 from kivy.app import App
 from kivy.animation import Animation
 from kivy.clock import Clock
+from kivy.core.text import LabelBase
 from kivy.core.window import Window
 from kivy.metrics import dp, sp
 from kivy.properties import ListProperty, NumericProperty, StringProperty
@@ -37,17 +40,33 @@ from kivy.utils import platform
 from datetime import datetime
 
 from words_data import COMMON_WORDS, LANGUAGE_LABELS
+from ui_strings import LANGUAGE_UI_STRINGS
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('voicefirst_app.log', mode='a')
+    ]
+)
+logger = logging.getLogger(__name__)
 
 try:
     from vosk import Model, KaldiRecognizer
-except ImportError:  # pragma: no cover
+    logger.info("Vosk library loaded successfully")
+except ImportError as e:  # pragma: no cover
     Model = None
     KaldiRecognizer = None
+    logger.warning(f"Vosk library not available: {e}")
 
 try:
     import pyaudio
-except ImportError:  # pragma: no cover
+    logger.info("PyAudio library loaded successfully")
+except ImportError as e:  # pragma: no cover
     pyaudio = None
+    logger.warning(f"PyAudio library not available: {e}")
 
 try:
     from jnius import JavaException, autoclass, cast, jarray
@@ -119,6 +138,7 @@ class ProgressStore:
 
     def save(self, word: str, state: WordState) -> None:
         self.store.put(word, **state.to_dict())
+        logger.debug(f"Saved progress for '{word}': mastery={state.mastery:.2f}, streak={state.streak}")
 
     def stats(self, vocabulary: List[str], threshold: float = 0.85) -> Tuple[int, int]:
         mastered = 0
@@ -257,6 +277,7 @@ class SRSDeck:
         state.last_seen = now
         state.due = now + max(1.5, state.interval * (1.0 - state.mastery + 0.1))
         self.store.save(word, state)
+        logger.info(f"Word '{word}' evaluated: correct={is_correct}, mastery={state.mastery:.2f}, streak={state.streak}")
         with self.lock:
             heapq.heappush(self.heap, (state.due, word))
         return state
@@ -295,46 +316,74 @@ class AudioListener:
         self._stream_cleanup: Optional[Callable[[], None]] = None
 
     def start(self) -> bool:
-        if not Model or not KaldiRecognizer:
-            return False
-        if self._thread and self._thread.is_alive():
+        try:
+            if not Model or not KaldiRecognizer:
+                logger.error("Voice recognition unavailable: Vosk library not loaded")
+                logger.info("To enable voice: pip install vosk")
+                return False
+            
+            if self._thread and self._thread.is_alive():
+                logger.info("Audio listener already running")
+                return True
+            
+            logger.info(f"Loading Vosk model from: {self.model_path}")
+            if not os.path.exists(self.model_path):
+                logger.error(f"Vosk model path does not exist: {self.model_path}")
+                return False
+            
+            model = Model(self.model_path)
+            self._recognizer = KaldiRecognizer(model, 16000)
+            logger.info("Vosk model loaded successfully")
+            
+            if self._stream_factory:
+                logger.info("Using custom audio stream factory")
+                stream, cleanup = self._stream_factory()
+                if stream is None:
+                    logger.error("Custom stream factory returned None")
+                    return False
+                self._stream = stream
+                self._stream_cleanup = cleanup
+            else:
+                if not pyaudio:
+                    logger.error("Voice recognition unavailable: PyAudio library not loaded")
+                    logger.info("To enable voice: pip install pyaudio")
+                    return False
+                
+                logger.info("Initializing PyAudio stream")
+                self._audio = pyaudio.PyAudio()
+                stream = self._audio.open(
+                    format=pyaudio.paInt16,
+                    channels=1,
+                    rate=16000,
+                    input=True,
+                    frames_per_buffer=4096,
+                )
+                self._stream = stream
+                logger.info("PyAudio stream opened successfully")
+
+                def cleanup() -> None:
+                    try:
+                        stream.stop_stream()
+                    except Exception:
+                        pass
+                    stream.close()
+                    if self._audio:
+                        self._audio.terminate()
+                    self._audio = None
+
+                self._stream_cleanup = cleanup
+            
+            self._running.set()
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+            logger.info("Audio listener thread started successfully")
             return True
-        model = Model(self.model_path)
-        self._recognizer = KaldiRecognizer(model, 16000)
-        if self._stream_factory:
-            stream, cleanup = self._stream_factory()
-            if stream is None:
-                return False
-            self._stream = stream
-            self._stream_cleanup = cleanup
-        else:
-            if not pyaudio:
-                return False
-            self._audio = pyaudio.PyAudio()
-            stream = self._audio.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=16000,
-                input=True,
-                frames_per_buffer=4096,
-            )
-            self._stream = stream
-
-            def cleanup() -> None:
-                try:
-                    stream.stop_stream()
-                except Exception:
-                    pass
-                stream.close()
-                if self._audio:
-                    self._audio.terminate()
-                self._audio = None
-
-            self._stream_cleanup = cleanup
-        self._running.set()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return True
+            
+        except Exception as e:
+            logger.error(f"Failed to start audio listener: {type(e).__name__}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return False
 
     def stop(self) -> None:
         self._running.clear()
@@ -372,23 +421,184 @@ class DashboardScreen(Screen):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        layout = BoxLayout(orientation="vertical", padding=dp(24), spacing=dp(24))
-        self.mastered_label = Label(text="Words Mastered: 0", font_size=sp(32), color=(0.86, 0.96, 0.99, 1))
-        self.remaining_label = Label(text="Words Remaining: 0", font_size=sp(32), color=(0.86, 0.96, 0.99, 1))
-        close_btn = Button(text="Back", size_hint=(1, 0.2), font_size=sp(20), background_normal="", background_color=(0.3, 0.4, 0.7, 1))
-        close_btn.bind(on_release=lambda *_: App.get_running_app().transition_back())
-        layout.add_widget(self.mastered_label)
-        layout.add_widget(self.remaining_label)
-        layout.add_widget(close_btn)
-        self.add_widget(layout)
+        main_layout = BoxLayout(orientation="vertical", padding=dp(20), spacing=dp(12))
+        
+        # Stats summary
+        self.mastered_label = Label(
+            text="Words Mastered: 0",
+            font_size=sp(28),
+            size_hint=(1, 0.08),
+            color=(0.86, 0.96, 0.99, 1)
+        )
+        self.remaining_label = Label(
+            text="Words Remaining: 0",
+            font_size=sp(28),
+            size_hint=(1, 0.08),
+            color=(0.86, 0.96, 0.99, 1)
+        )
+        
+        # Word lists in scrollview
+        scroll = ScrollView(size_hint=(1, 0.64))
+        self.words_layout = BoxLayout(
+            orientation="vertical",
+            size_hint_y=None,
+            spacing=dp(8),
+            padding=dp(8)
+        )
+        self.words_layout.bind(minimum_height=self.words_layout.setter('height'))
+        scroll.add_widget(self.words_layout)
+        
+        # Button controls
+        button_controls = BoxLayout(size_hint=(1, 0.12), spacing=dp(16))
+        self.continue_btn = Button(
+            text="Continue",
+            font_size=sp(20),
+            background_normal="",
+            background_color=(0.3, 0.7, 0.4, 1)
+        )
+        self.continue_btn.bind(on_release=lambda *_: self.continue_training())
+        menu_btn = Button(
+            text="Main Menu",
+            font_size=sp(20),
+            background_normal="",
+            background_color=(0.5, 0.5, 0.5, 1)
+        )
+        menu_btn.bind(on_release=lambda *_: self.go_to_menu())
+        button_controls.add_widget(self.continue_btn)
+        button_controls.add_widget(menu_btn)
+        
+        main_layout.add_widget(self.mastered_label)
+        main_layout.add_widget(self.remaining_label)
+        main_layout.add_widget(scroll)
+        main_layout.add_widget(button_controls)
+        self.add_widget(main_layout)
+    
+    def on_pre_enter(self) -> None:
+        """Refresh stats when entering the dashboard."""
+        self.refresh()
+    
+    def continue_training(self) -> None:
+        app: VoiceFirstApp = App.get_running_app()  # type: ignore
+        if app.session:
+            app.manager.current = "training"
+        else:
+            # No active session, go back to menu
+            app.manager.current = "mode"
+    
+    def go_to_menu(self) -> None:
+        app: VoiceFirstApp = App.get_running_app()  # type: ignore
+        app.manager.current = "mode"
 
     def refresh(self) -> None:
         app: VoiceFirstApp = App.get_running_app()  # type: ignore
+        
+        # Clear previous word lists
+        self.words_layout.clear_widgets()
+        
+        # Determine which words to analyze
         if not app.session:
+            # Show overall stats if no active session
+            self.continue_btn.text = "Back"
+            if app.progress and app.language_labels:
+                words = app.loader.load_common_words(app.target_language)
+            else:
+                words = []
+        else:
+            # Active session - show session words
+            self.continue_btn.text = "Continue"
+            words = app.session.unique_words
+        
+        if not words:
+            self.mastered_label.text = "Words Mastered: 0"
+            self.remaining_label.text = "Words Remaining: 0"
             return
-        mastered, remaining = app.progress.stats(app.session.unique_words)
-        self.mastered_label.text = f"Words Mastered: {mastered}"
-        self.remaining_label.text = f"Words Remaining: {remaining}"
+        
+        # Categorize words
+        mastered_words = []
+        in_progress_words = []
+        not_attempted_words = []
+        
+        for word in words:
+            if app.progress.store.exists(word):
+                mastery = app.progress.store.get(word).get("mastery", 0.0)
+                if mastery >= 0.85:
+                    mastered_words.append((word, mastery))
+                elif mastery > 0.0:
+                    in_progress_words.append((word, mastery))
+                else:
+                    not_attempted_words.append(word)
+            else:
+                not_attempted_words.append(word)
+        
+        # Update summary
+        self.mastered_label.text = f"Words Mastered: {len(mastered_words)}"
+        self.remaining_label.text = f"Words Remaining: {len(words) - len(mastered_words)}"
+        
+        # Display mastered words
+        if mastered_words:
+            self._add_section_header("✓ Mastered Words", (0.2, 0.8, 0.3, 1))
+            for word, mastery in sorted(mastered_words, key=lambda x: -x[1]):
+                self._add_word_item(word, mastery, (0.2, 0.7, 0.3, 1))
+        
+        # Display in-progress words
+        if in_progress_words:
+            self._add_section_header("⏳ In Progress", (0.3, 0.6, 0.9, 1))
+            for word, mastery in sorted(in_progress_words, key=lambda x: -x[1]):
+                self._add_word_item(word, mastery, (0.3, 0.5, 0.8, 1))
+        
+        # Display not attempted words (first 20 only to avoid clutter)
+        if not_attempted_words:
+            self._add_section_header(
+                f"○ Not Attempted ({len(not_attempted_words)})",
+                (0.6, 0.6, 0.6, 1)
+            )
+            for word in sorted(not_attempted_words[:20]):
+                self._add_word_item(word, 0.0, (0.5, 0.5, 0.5, 1))
+            if len(not_attempted_words) > 20:
+                more_label = Label(
+                    text=f"... and {len(not_attempted_words) - 20} more",
+                    size_hint_y=None,
+                    height=dp(32),
+                    font_size=sp(14),
+                    color=(0.7, 0.7, 0.7, 1),
+                    italic=True
+                )
+                self.words_layout.add_widget(more_label)
+    
+    def _add_section_header(self, text: str, color: tuple) -> None:
+        """Add a section header to the word list."""
+        header = Label(
+            text=text,
+            size_hint_y=None,
+            height=dp(40),
+            font_size=sp(20),
+            bold=True,
+            color=color,
+            halign="left",
+            valign="middle"
+        )
+        header.bind(size=header.setter('text_size'))
+        self.words_layout.add_widget(header)
+    
+    def _add_word_item(self, word: str, mastery: float, color: tuple) -> None:
+        """Add a word item to the list."""
+        mastery_pct = int(mastery * 100)
+        if mastery > 0:
+            text = f"{word} ({mastery_pct}%)"
+        else:
+            text = word
+        
+        label = Label(
+            text=text,
+            size_hint_y=None,
+            height=dp(32),
+            font_size=sp(16),
+            color=color,
+            halign="left",
+            valign="middle"
+        )
+        label.bind(size=label.setter('text_size'))
+        self.words_layout.add_widget(label)
 
 
 class TrainingScreen(Screen):
@@ -412,12 +622,15 @@ class TrainingScreen(Screen):
         self.progress_bar.color = (0.25, 0.74, 0.87, 1)
         self.feedback_label = Label(text="", font_size=sp(24), size_hint=(1, 0.2), color=(0.85, 0.93, 1, 1))
         controls = BoxLayout(size_hint=(1, 0.2), spacing=dp(16))
-        skip_btn = Button(text="Skip", size_hint=(0.5, 1), font_size=sp(20), background_normal="", background_color=(0.8, 0.4, 0.4, 1))
+        skip_btn = Button(text="Skip", size_hint=(0.33, 1), font_size=sp(20), background_normal="", background_color=(0.8, 0.4, 0.4, 1))
         skip_btn.bind(on_release=lambda *_: self.skip_current())
-        dash_btn = Button(text="Dashboard", size_hint=(0.5, 1), font_size=sp(20), background_normal="", background_color=(0.35, 0.6, 0.9, 1))
+        dash_btn = Button(text="Dashboard", size_hint=(0.33, 1), font_size=sp(20), background_normal="", background_color=(0.35, 0.6, 0.9, 1))
         dash_btn.bind(on_release=lambda *_: self.show_dashboard())
+        back_btn = Button(text="Main Menu", size_hint=(0.34, 1), font_size=sp(20), background_normal="", background_color=(0.5, 0.5, 0.5, 1))
+        back_btn.bind(on_release=lambda *_: self.return_to_menu())
         controls.add_widget(skip_btn)
         controls.add_widget(dash_btn)
+        controls.add_widget(back_btn)
         root.add_widget(self.language_label)
         root.add_widget(self.word_label)
         root.add_widget(self.progress_bar)
@@ -427,6 +640,9 @@ class TrainingScreen(Screen):
 
     def on_enter(self) -> None:
         self._queue_event = Clock.schedule_interval(self._drain_audio_queue, 0.1)
+        # Restart timer if we're in the middle of a word
+        if self._word_started_at and self._awaiting_result and self._timer_event is None:
+            self._timer_event = Clock.schedule_interval(self._update_timer, 1 / 30)
 
     def on_leave(self) -> None:
         if self._timer_event is not None:
@@ -460,7 +676,9 @@ class TrainingScreen(Screen):
         elapsed = time.perf_counter() - self._word_started_at
         self.progress_bar.value = min(elapsed, self.progress_bar.max)
         if elapsed > 5.0 and self._awaiting_result:
-            self.feedback_label.text = f"Keep trying... {elapsed:.1f}s"
+            app: VoiceFirstApp = App.get_running_app()  # type: ignore
+            ui_strings = LANGUAGE_UI_STRINGS.get(app.target_language, LANGUAGE_UI_STRINGS["en"])
+            self.feedback_label.text = f"{ui_strings['keep_trying']} {elapsed:.1f}s"
 
     def _drain_audio_queue(self, _dt: float) -> None:
         app: VoiceFirstApp = App.get_running_app()  # type: ignore
@@ -482,17 +700,21 @@ class TrainingScreen(Screen):
             self._timer_event.cancel()
         app: VoiceFirstApp = App.get_running_app()  # type: ignore
         state = app.on_word_evaluated(is_correct, elapsed, transcript, score)
+        
+        # Get localized UI strings
+        ui_strings = LANGUAGE_UI_STRINGS.get(app.target_language, LANGUAGE_UI_STRINGS["en"])
+        
         if is_correct:
             self.word_label.color = (0.2, 0.8, 0.2, 1)
-            self.feedback_label.text = f"Great! {elapsed:.2f}s"
+            self.feedback_label.text = f"{ui_strings['great']} {elapsed:.2f}s"
             Animation.cancel_all(self.word_label)
             Animation(font_size=self._base_font_size * 1.05, duration=0.1).start(self.word_label)
         else:
             self.word_label.color = (0.9, 0.2, 0.2, 1)
             if transcript:
-                self.feedback_label.text = f"Heard '{transcript}' ({score:.0%})"
+                self.feedback_label.text = f"{ui_strings['heard']} '{transcript}' ({score:.0%})"
             else:
-                self.feedback_label.text = "Try again"
+                self.feedback_label.text = ui_strings['try_again']
             Animation.cancel_all(self.word_label)
             Animation(font_size=self._base_font_size * 0.92, duration=0.1).start(self.word_label)
         Clock.schedule_once(self._restore_word_label_size, 0.25)
@@ -531,6 +753,10 @@ class TrainingScreen(Screen):
 
     def set_language(self, label: str) -> None:
         self.language_label.text = f"Language: {label}"
+    
+    def return_to_menu(self) -> None:
+        app: VoiceFirstApp = App.get_running_app()  # type: ignore
+        app.show_mode_selection()
 
 
 class FileChooserPopup(Popup):
@@ -554,35 +780,166 @@ class FileChooserPopup(Popup):
             self.dismiss()
 
 
+class LanguageSelectionScreen(Screen):
+    """Dedicated screen for selecting practice language with native scripts."""
+    
+    def __init__(self, languages: Dict[str, str], **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.languages = languages
+        self.selected_language = None
+        self.language_buttons = {}
+        
+        main_layout = BoxLayout(orientation="vertical", padding=dp(20), spacing=dp(16))
+        
+        # Title
+        title = Label(
+            text="Select Practice Language",
+            font_size=sp(36),
+            size_hint=(1, 0.1),
+            color=(1, 1, 1, 1),
+            bold=True
+        )
+        
+        # Scrollable language grid with larger buttons
+        scroll = ScrollView(size_hint=(1, 0.75))
+        self.lang_grid = GridLayout(
+            cols=4,
+            spacing=dp(12),
+            size_hint_y=None,
+            padding=dp(8)
+        )
+        self.lang_grid.bind(minimum_height=self.lang_grid.setter('height'))
+        
+        # Create language buttons with native scripts
+        sorted_langs = sorted(languages.items(), key=lambda x: x[1])
+        for code, label in sorted_langs:
+            btn = Button(
+                text=label,
+                size_hint_y=None,
+                height=dp(80),
+                font_size=sp(20),
+                font_name='NotoSans',  # Use Unicode-capable font
+                background_normal="",
+                background_color=(0.25, 0.35, 0.55, 1)
+            )
+            btn.bind(on_release=lambda b, c=code: self.select_language(c))
+            self.language_buttons[code] = btn
+            self.lang_grid.add_widget(btn)
+        
+        scroll.add_widget(self.lang_grid)
+        
+        # Back button
+        back_btn = Button(
+            text="Back to Main Menu",
+            size_hint=(1, 0.12),
+            font_size=sp(22),
+            background_normal="",
+            background_color=(0.5, 0.5, 0.5, 1)
+        )
+        back_btn.bind(on_release=lambda *_: self.return_to_menu())
+        
+        main_layout.add_widget(title)
+        main_layout.add_widget(scroll)
+        main_layout.add_widget(back_btn)
+        
+        self.add_widget(main_layout)
+        Clock.schedule_once(lambda *_: self._sync_to_app(), 0)
+    
+    def select_language(self, code: str) -> None:
+        """Update language selection and return to main menu."""
+        # Update visual selection
+        for lang_code, btn in self.language_buttons.items():
+            if lang_code == code:
+                btn.background_color = (0.2, 0.7, 0.3, 1)  # Green highlight
+            else:
+                btn.background_color = (0.25, 0.35, 0.55, 1)  # Normal
+        
+        self.selected_language = code
+        app: VoiceFirstApp = App.get_running_app()  # type: ignore
+        app.set_target_language(code)
+        
+        # Return to main menu after brief delay
+        Clock.schedule_once(lambda *_: self.return_to_menu(), 0.3)
+    
+    def return_to_menu(self) -> None:
+        app: VoiceFirstApp = App.get_running_app()  # type: ignore
+        app.show_mode_selection()
+    
+    def _sync_to_app(self) -> None:
+        """Sync display with app's current language."""
+        app: VoiceFirstApp = App.get_running_app()  # type: ignore
+        code = getattr(app, "target_language", next(iter(self.languages)))
+        self.update_language_display(code)
+    
+    def update_language_display(self, language_code: str) -> None:
+        """Update button highlight to show current language."""
+        if language_code not in self.language_buttons:
+            return
+        for lang_code, btn in self.language_buttons.items():
+            if lang_code == language_code:
+                btn.background_color = (0.2, 0.7, 0.3, 1)
+            else:
+                btn.background_color = (0.25, 0.35, 0.55, 1)
+        self.selected_language = language_code
+
+
 class ModeSelectionScreen(Screen):
     def __init__(self, languages: Dict[str, str], **kwargs) -> None:
         super().__init__(**kwargs)
         self.languages = languages
-        self._code_by_label = {label: code for code, label in languages.items()}
-        layout = BoxLayout(orientation="vertical", padding=dp(32), spacing=dp(24))
-        title = Label(text="Voice-First Literacy Coach", font_size=sp(48), size_hint=(1, 0.25), color=(1, 1, 1, 1))
-        self.language_spinner = Spinner(
+        
+        main_layout = BoxLayout(orientation="vertical", padding=dp(20), spacing=dp(16))
+        
+        # Title
+        title = Label(text="Voice-First Literacy Coach", font_size=sp(36), size_hint=(1, 0.15), color=(1, 1, 1, 1))
+        
+        # Current language display with native script
+        self.lang_display = Label(
             text="",
-            values=tuple(languages.values()),
-            size_hint=(1, 0.2),
-            font_size=sp(20),
-            background_normal="",
-            background_color=(0.23, 0.35, 0.6, 1),
+            font_size=sp(24),
+            font_name='NotoSans',
+            size_hint=(1, 0.10),
+            color=(0.8, 0.9, 1, 1)
         )
-        self.language_spinner.bind(text=self._on_language_selected)
-        mode_a_btn = Button(text="Start 1000 Words", size_hint=(1, 0.22), font_size=sp(24), background_normal="", background_color=(0.18, 0.5, 0.82, 1))
-        mode_b_btn = Button(text="Load ePub Story", size_hint=(1, 0.22), font_size=sp(24), background_normal="", background_color=(0.26, 0.67, 0.5, 1))
-        settings_btn = Button(text="Settings & Models", size_hint=(1, 0.22), font_size=sp(22), background_normal="", background_color=(0.45, 0.45, 0.78, 1))
+        
+        # Action buttons
+        select_lang_btn = Button(
+            text="Select Language",
+            size_hint=(1, 0.13),
+            font_size=sp(22),
+            background_normal="",
+            background_color=(0.2, 0.6, 0.9, 1)
+        )
+        mode_a_btn = Button(text="Start 1000 Words", size_hint=(1, 0.13), font_size=sp(22), background_normal="", background_color=(0.18, 0.5, 0.82, 1))
+        mode_b_btn = Button(text="Load ePub Story", size_hint=(1, 0.13), font_size=sp(22), background_normal="", background_color=(0.26, 0.67, 0.5, 1))
+        dashboard_btn = Button(text="Dashboard", size_hint=(1, 0.12), font_size=sp(20), background_normal="", background_color=(0.35, 0.6, 0.9, 1))
+        settings_btn = Button(text="Settings & Models", size_hint=(1, 0.12), font_size=sp(20), background_normal="", background_color=(0.45, 0.45, 0.78, 1))
+        quit_btn = Button(text="Quit", size_hint=(1, 0.12), font_size=sp(18), background_normal="", background_color=(0.7, 0.3, 0.3, 1))
+        
+        select_lang_btn.bind(on_release=lambda *_: self.select_language())
         mode_a_btn.bind(on_release=lambda *_: self.start_common())
         mode_b_btn.bind(on_release=lambda *_: self.choose_epub())
+        dashboard_btn.bind(on_release=lambda *_: self.open_dashboard())
         settings_btn.bind(on_release=lambda *_: self.open_settings())
-        layout.add_widget(title)
-        layout.add_widget(self.language_spinner)
-        layout.add_widget(mode_a_btn)
-        layout.add_widget(mode_b_btn)
-        layout.add_widget(settings_btn)
-        self.add_widget(layout)
-        Clock.schedule_once(lambda *_: self._sync_spinner_to_app(), 0)
+        quit_btn.bind(on_release=lambda *_: self.quit_app())
+        
+        # Add all to main layout
+        main_layout.add_widget(title)
+        main_layout.add_widget(self.lang_display)
+        main_layout.add_widget(select_lang_btn)
+        main_layout.add_widget(mode_a_btn)
+        main_layout.add_widget(mode_b_btn)
+        main_layout.add_widget(dashboard_btn)
+        main_layout.add_widget(settings_btn)
+        main_layout.add_widget(quit_btn)
+        
+        self.add_widget(main_layout)
+        Clock.schedule_once(lambda *_: self._sync_to_app(), 0)
+    
+    def select_language(self) -> None:
+        """Open language selection screen."""
+        app: VoiceFirstApp = App.get_running_app()  # type: ignore
+        app.show_language_selection()
 
     def start_common(self) -> None:
         app: VoiceFirstApp = App.get_running_app()  # type: ignore
@@ -599,46 +956,107 @@ class ModeSelectionScreen(Screen):
     def open_settings(self) -> None:
         app: VoiceFirstApp = App.get_running_app()  # type: ignore
         app.show_settings()
-
-    def _on_language_selected(self, _spinner: Spinner, value: str) -> None:
-        code = self._code_by_label.get(value)
-        if not code:
-            return
+    
+    def open_dashboard(self) -> None:
         app: VoiceFirstApp = App.get_running_app()  # type: ignore
-        app.set_target_language(code)
+        app.show_dashboard()
 
-    def _sync_spinner_to_app(self) -> None:
+    def quit_app(self) -> None:
+        app: VoiceFirstApp = App.get_running_app()  # type: ignore
+        app.stop()
+
+    def _sync_to_app(self) -> None:
         app: VoiceFirstApp = App.get_running_app()  # type: ignore
         code = getattr(app, "target_language", next(iter(self.languages)))
         self.update_language_display(code)
 
     def update_language_display(self, language_code: str) -> None:
-        label = self.languages.get(language_code)
-        if not label:
-            return
-        self.language_spinner.text = label
+        """Update the language display label."""
+        if language_code in self.languages:
+            label = self.languages[language_code]
+            self.lang_display.text = f"Practice Language: {label}"
+        else:
+            self.lang_display.text = "Practice Language: Not Selected"
 
     def update_languages(self, languages: Dict[str, str]) -> None:
-        previous_selection = self.language_spinner.text
+        """Update available languages."""
         self.languages = languages
-        self._code_by_label = {label: code for code, label in languages.items()}
-        values = tuple(languages.values())
-        self.language_spinner.values = values
-        if previous_selection in values:
-            self.language_spinner.text = previous_selection
-        elif values:
-            self.language_spinner.text = values[0]
 
+
+# Map language codes to model URL patterns for automatic model switching
+LANGUAGE_MODEL_MAP = {
+    "en": "en-us",  # English -> US model
+    "nl": "nl",     # Dutch
+    "de": "de",     # German
+    "fr": "fr",     # French
+    "es": "es",     # Spanish
+    "pt": "pt",     # Portuguese
+    "it": "it",     # Italian
+    "ca": "ca",     # Catalan
+    "cs": "cs",     # Czech
+    "pl": "pl",     # Polish
+    "ru": "ru",     # Russian
+    "uk": "uk",     # Ukrainian
+    "zh": "cn",     # Chinese -> cn in Vosk
+    "ja": "ja",     # Japanese
+    "ko": "ko",     # Korean
+    "vi": "vn",     # Vietnamese -> vn in Vosk
+    "hi": "hi",     # Hindi
+    "tr": "tr",     # Turkish
+    "fa": "fa",     # Farsi
+    "kk": "kz",     # Kazakh -> kz in Vosk
+    "uz": "uz",     # Uzbek
+    "ky": "ky",     # Kyrgyz
+    "tg": "tg",     # Tajik
+    "gu": "gu",     # Gujarati
+    "te": "te",     # Telugu
+    "eo": "eo",     # Esperanto
+}
 
 DOWNLOADABLE_MODELS: List[Dict[str, str]] = [
-    {
-        "label": "English (US) Small 0.15",
-        "url": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
-    },
-    {
-        "label": "Dutch Small 0.22",
-        "url": "https://alphacephei.com/vosk/models/vosk-model-small-nl-0.22.zip",
-    },
+    # English variants
+    {"label": "English (US) Small 0.15", "url": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip", "size_mb": 40},
+    {"label": "English (India) Small 0.4", "url": "https://alphacephei.com/vosk/models/vosk-model-small-en-in-0.4.zip", "size_mb": 36},
+    
+    # European languages
+    {"label": "Dutch Small 0.22", "url": "https://alphacephei.com/vosk/models/vosk-model-small-nl-0.22.zip", "size_mb": 39},
+    {"label": "French Small 0.22", "url": "https://alphacephei.com/vosk/models/vosk-model-small-fr-0.22.zip", "size_mb": 41},
+    {"label": "German Small 0.15", "url": "https://alphacephei.com/vosk/models/vosk-model-small-de-0.15.zip", "size_mb": 45},
+    {"label": "Spanish Small 0.42", "url": "https://alphacephei.com/vosk/models/vosk-model-small-es-0.42.zip", "size_mb": 39},
+    {"label": "Portuguese Small 0.3", "url": "https://alphacephei.com/vosk/models/vosk-model-small-pt-0.3.zip", "size_mb": 31},
+    {"label": "Italian Small 0.22", "url": "https://alphacephei.com/vosk/models/vosk-model-small-it-0.22.zip", "size_mb": 48},
+    {"label": "Catalan Small 0.4", "url": "https://alphacephei.com/vosk/models/vosk-model-small-ca-0.4.zip", "size_mb": 42},
+    {"label": "Czech Small 0.4", "url": "https://alphacephei.com/vosk/models/vosk-model-small-cs-0.4-rhasspy.zip", "size_mb": 44},
+    {"label": "Polish Small 0.22", "url": "https://alphacephei.com/vosk/models/vosk-model-small-pl-0.22.zip", "size_mb": 50},
+    
+    # Slavic languages
+    {"label": "Russian Small 0.22", "url": "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip", "size_mb": 45},
+    {"label": "Ukrainian Small Nano", "url": "https://alphacephei.com/vosk/models/vosk-model-small-uk-v3-nano.zip", "size_mb": 73},
+    {"label": "Ukrainian Small v3", "url": "https://alphacephei.com/vosk/models/vosk-model-small-uk-v3-small.zip", "size_mb": 133},
+    
+    # Asian languages
+    {"label": "Chinese Small 0.22", "url": "https://alphacephei.com/vosk/models/vosk-model-small-cn-0.22.zip", "size_mb": 42},
+    {"label": "Japanese Small 0.22", "url": "https://alphacephei.com/vosk/models/vosk-model-small-ja-0.22.zip", "size_mb": 48},
+    {"label": "Korean Small 0.22", "url": "https://alphacephei.com/vosk/models/vosk-model-small-ko-0.22.zip", "size_mb": 82},
+    {"label": "Vietnamese Small 0.4", "url": "https://alphacephei.com/vosk/models/vosk-model-small-vn-0.4.zip", "size_mb": 32},
+    {"label": "Hindi Small 0.22", "url": "https://alphacephei.com/vosk/models/vosk-model-small-hi-0.22.zip", "size_mb": 42},
+    
+    # Middle Eastern languages
+    {"label": "Turkish Small 0.3", "url": "https://alphacephei.com/vosk/models/vosk-model-small-tr-0.3.zip", "size_mb": 35},
+    {"label": "Farsi (Persian) Small 0.42", "url": "https://alphacephei.com/vosk/models/vosk-model-small-fa-0.42.zip", "size_mb": 53},
+    
+    # Central Asian languages
+    {"label": "Kazakh Small 0.42", "url": "https://alphacephei.com/vosk/models/vosk-model-small-kz-0.42.zip", "size_mb": 58},
+    {"label": "Uzbek Small 0.22", "url": "https://alphacephei.com/vosk/models/vosk-model-small-uz-0.22.zip", "size_mb": 49},
+    {"label": "Kyrgyz Small 0.42", "url": "https://alphacephei.com/vosk/models/vosk-model-small-ky-0.42.zip", "size_mb": 49},
+    {"label": "Tajik Small 0.22", "url": "https://alphacephei.com/vosk/models/vosk-model-small-tg-0.22.zip", "size_mb": 50},
+    
+    # Indian subcontinent languages
+    {"label": "Gujarati Small 0.42", "url": "https://alphacephei.com/vosk/models/vosk-model-small-gu-0.42.zip", "size_mb": 100},
+    {"label": "Telugu Small 0.42", "url": "https://alphacephei.com/vosk/models/vosk-model-small-te-0.42.zip", "size_mb": 58},
+    
+    # Other languages
+    {"label": "Esperanto Small 0.42", "url": "https://alphacephei.com/vosk/models/vosk-model-small-eo-0.42.zip", "size_mb": 42},
 ]
 
 
@@ -684,23 +1102,86 @@ class ModelSettingsScreen(Screen):
                 if not path:
                     continue
                 is_active = active and os.path.abspath(path) == os.path.abspath(active)
+                
+                # Create horizontal layout with model button and delete button
+                row = BoxLayout(orientation="horizontal", size_hint=(1, None), height=dp(64), spacing=dp(8))
+                
                 button = Button(
                     text=f"{label}\n{path}",
-                    size_hint=(1, None),
-                    height=dp(64),
+                    size_hint=(0.85, 1),
                     halign="left",
                     valign="middle",
                     background_normal="",
                     background_color=(0.24, 0.58, 0.4, 1) if is_active else (0.21, 0.28, 0.48, 1),
                 )
-                button.text_size = (Window.width - dp(96), None)
+                button.text_size = (Window.width - dp(150), None)
                 button.bind(size=lambda inst, _size: setattr(inst, "text_size", (inst.width - dp(24), None)))
                 button.padding = (dp(16), dp(12))
                 button.bind(on_release=lambda *_btn, target=path: app.set_model_path(target))
-                self.models_layout.add_widget(button)
-        download_header = Label(text="Download official models", size_hint=(1, None), height=dp(42), font_size=sp(18), color=(0.82, 0.9, 1, 1))
+                
+                delete_btn = Button(
+                    text="🗑️",
+                    size_hint=(0.15, 1),
+                    font_size=sp(24),
+                    background_normal="",
+                    background_color=(0.8, 0.3, 0.3, 1),
+                )
+                delete_btn.bind(on_release=lambda *_btn, target=path, model_label=label: self._confirm_delete_model(target, model_label))
+                
+                row.add_widget(button)
+                row.add_widget(delete_btn)
+                self.models_layout.add_widget(row)
+        download_header = Label(text="Download official models", size_hint=(1, None), height=dp(48), font_size=sp(20), color=(0.82, 0.9, 1, 1), bold=True)
         self.models_layout.add_widget(download_header)
+        
+        # Group models by category for better organization
+        current_category = None
         for spec in DOWNLOADABLE_MODELS:
+            # Extract category from label (text before first language name)
+            label = spec.get("label", "")
+            if "English" in label and current_category != "English":
+                current_category = "English"
+                cat_label = Label(text="🇬🇧 English Variants", size_hint=(1, None), height=dp(32), font_size=sp(16), color=(0.7, 0.85, 1, 1), halign="left")
+                cat_label.bind(size=cat_label.setter("text_size"))
+                self.models_layout.add_widget(cat_label)
+            elif any(lang in label for lang in ["Dutch", "French", "German", "Spanish", "Portuguese", "Italian", "Catalan", "Czech", "Polish"]) and current_category != "European":
+                if "English" not in label:  # Skip if it's English
+                    if current_category != "European":
+                        current_category = "European"
+                        cat_label = Label(text="🇪🇺 European Languages", size_hint=(1, None), height=dp(32), font_size=sp(16), color=(0.7, 0.85, 1, 1), halign="left")
+                        cat_label.bind(size=cat_label.setter("text_size"))
+                        self.models_layout.add_widget(cat_label)
+            elif any(lang in label for lang in ["Russian", "Ukrainian"]) and current_category != "Slavic":
+                current_category = "Slavic"
+                cat_label = Label(text="🇷🇺 Slavic Languages", size_hint=(1, None), height=dp(32), font_size=sp(16), color=(0.7, 0.85, 1, 1), halign="left")
+                cat_label.bind(size=cat_label.setter("text_size"))
+                self.models_layout.add_widget(cat_label)
+            elif any(lang in label for lang in ["Chinese", "Japanese", "Korean", "Vietnamese", "Hindi"]) and current_category != "Asian":
+                current_category = "Asian"
+                cat_label = Label(text="🌏 Asian Languages", size_hint=(1, None), height=dp(32), font_size=sp(16), color=(0.7, 0.85, 1, 1), halign="left")
+                cat_label.bind(size=cat_label.setter("text_size"))
+                self.models_layout.add_widget(cat_label)
+            elif any(lang in label for lang in ["Turkish", "Farsi", "Persian"]) and current_category != "MiddleEast":
+                current_category = "MiddleEast"
+                cat_label = Label(text="🕌 Middle Eastern Languages", size_hint=(1, None), height=dp(32), font_size=sp(16), color=(0.7, 0.85, 1, 1), halign="left")
+                cat_label.bind(size=cat_label.setter("text_size"))
+                self.models_layout.add_widget(cat_label)
+            elif any(lang in label for lang in ["Kazakh", "Uzbek", "Kyrgyz", "Tajik"]) and current_category != "CentralAsian":
+                current_category = "CentralAsian"
+                cat_label = Label(text="🏔️ Central Asian Languages", size_hint=(1, None), height=dp(32), font_size=sp(16), color=(0.7, 0.85, 1, 1), halign="left")
+                cat_label.bind(size=cat_label.setter("text_size"))
+                self.models_layout.add_widget(cat_label)
+            elif any(lang in label for lang in ["Gujarati", "Telugu"]) and current_category != "IndianSubcontinent":
+                current_category = "IndianSubcontinent"
+                cat_label = Label(text="🇮🇳 Indian Subcontinent", size_hint=(1, None), height=dp(32), font_size=sp(16), color=(0.7, 0.85, 1, 1), halign="left")
+                cat_label.bind(size=cat_label.setter("text_size"))
+                self.models_layout.add_widget(cat_label)
+            elif "Esperanto" in label and current_category != "Other":
+                current_category = "Other"
+                cat_label = Label(text="🌍 Other Languages", size_hint=(1, None), height=dp(32), font_size=sp(16), color=(0.7, 0.85, 1, 1), halign="left")
+                cat_label.bind(size=cat_label.setter("text_size"))
+                self.models_layout.add_widget(cat_label)
+            
             title = spec.get("label", spec.get("url", "Vosk Model"))
             download_btn = Button(
                 text=f"Get {title}",
@@ -727,8 +1208,97 @@ class ModelSettingsScreen(Screen):
         if not url:
             return
         label = spec.get("label", url)
+        size_mb = spec.get("size_mb", 45)  # Default to 45MB for small models
+        
+        # Check network type for large downloads
+        if size_mb >= 30:
+            network = get_network_type()
+            if network == "cellular":
+                self._show_cellular_warning(label, url, size_mb)
+                return
+            elif network == "none":
+                self.set_status("No internet connection detected")
+                return
+        
         app: VoiceFirstApp = App.get_running_app()  # type: ignore
         app.queue_model_download(label, url)
+
+    def _show_cellular_warning(self, label: str, url: str, size_mb: int) -> None:
+        """Show warning when downloading on cellular data."""
+        content = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(16))
+        message = Label(
+            text=f"You are on cellular data!\n\nModel: {label}\nSize: ~{size_mb}MB\n\nThis will use your mobile data. Continue?",
+            size_hint=(1, 0.7),
+            halign="center",
+            valign="middle",
+        )
+        message.bind(size=message.setter("text_size"))
+        content.add_widget(message)
+        
+        buttons = BoxLayout(orientation="horizontal", size_hint=(1, 0.3), spacing=dp(12))
+        cancel_btn = Button(text="Cancel", background_normal="", background_color=(0.4, 0.4, 0.4, 1))
+        download_btn = Button(text="Download Anyway", background_normal="", background_color=(0.2, 0.6, 0.9, 1))
+        buttons.add_widget(cancel_btn)
+        buttons.add_widget(download_btn)
+        content.add_widget(buttons)
+        
+        popup = Popup(
+            title="⚠️ Cellular Data Warning",
+            content=content,
+            size_hint=(0.85, 0.4),
+            auto_dismiss=False,
+        )
+        
+        cancel_btn.bind(on_release=popup.dismiss)
+        download_btn.bind(on_release=lambda *_: self._confirm_cellular_download(label, url, popup))
+        popup.open()
+
+    def _confirm_cellular_download(self, label: str, url: str, popup: Popup) -> None:
+        """Proceed with download after cellular warning."""
+        popup.dismiss()
+        app: VoiceFirstApp = App.get_running_app()  # type: ignore
+        app.queue_model_download(label, url)
+
+    def _confirm_delete_model(self, path: str, label: str) -> None:
+        """Show confirmation dialog before deleting a model."""
+        content = BoxLayout(orientation="vertical", padding=dp(16), spacing=dp(16))
+        message = Label(
+            text=f"Are you sure you want to delete this model?\n\n{label}\n\nThis action cannot be undone.",
+            size_hint=(1, 0.7),
+            halign="center",
+            valign="middle",
+        )
+        message.bind(size=message.setter("text_size"))
+        content.add_widget(message)
+        
+        buttons = BoxLayout(orientation="horizontal", size_hint=(1, 0.3), spacing=dp(12))
+        cancel_btn = Button(text="Cancel", background_normal="", background_color=(0.4, 0.4, 0.4, 1))
+        delete_btn = Button(text="Delete", background_normal="", background_color=(0.8, 0.2, 0.2, 1))
+        buttons.add_widget(cancel_btn)
+        buttons.add_widget(delete_btn)
+        content.add_widget(buttons)
+        
+        popup = Popup(
+            title="Confirm Deletion",
+            content=content,
+            size_hint=(0.85, 0.4),
+            auto_dismiss=False,
+        )
+        
+        cancel_btn.bind(on_release=popup.dismiss)
+        delete_btn.bind(on_release=lambda *_: self._delete_model(path, popup))
+        popup.open()
+
+    def _delete_model(self, path: str, popup: Popup) -> None:
+        """Delete the model and refresh the list."""
+        app: VoiceFirstApp = App.get_running_app()  # type: ignore
+        success = app.delete_model(path)
+        popup.dismiss()
+        if success:
+            self.set_status("Model deleted successfully")
+            self.refresh_models()
+        else:
+            self.set_status("Failed to delete model")
 
 
 def _locate_vosk_model(models_dir: Path) -> Optional[Path]:
@@ -866,6 +1436,12 @@ def android_stream_factory() -> Tuple[Optional[object], Optional[Callable[[], No
 
 
 def ensure_android_permissions() -> None:
+    """Request microphone permissions on Android.
+    
+    Android microphone permissions are handled here.
+    Note: Permissions must also be declared in buildozer.spec:
+        android.permissions = INTERNET,RECORD_AUDIO,READ_EXTERNAL_STORAGE
+    """
     if platform != "android":
         return
     try:
@@ -878,6 +1454,47 @@ def ensure_android_permissions() -> None:
         pass
 
 
+def get_network_type() -> str:
+    """Detect the current network type.
+    
+    Returns:
+        'wifi' - Connected to WiFi
+        'cellular' - Connected to cellular/mobile data
+        'none' - No connection
+        'unknown' - Cannot determine
+    """
+    if platform == "android":
+        try:
+            from jnius import autoclass
+            Context = autoclass("android.content.Context")
+            ConnectivityManager = autoclass("android.net.ConnectivityManager")
+            PythonActivity = autoclass("org.kivy.android.PythonActivity")
+            
+            activity = PythonActivity.mActivity
+            connectivity = activity.getSystemService(Context.CONNECTIVITY_SERVICE)
+            network_info = connectivity.getActiveNetworkInfo()
+            
+            if network_info is None or not network_info.isConnected():
+                return "none"
+            
+            network_type = network_info.getType()
+            # TYPE_WIFI = 1, TYPE_MOBILE = 0
+            if network_type == 1:
+                return "wifi"
+            elif network_type == 0:
+                return "cellular"
+            return "unknown"
+        except Exception:
+            return "unknown"
+    elif platform == "ios":
+        # iOS network detection would require pyobjus and Reachability
+        # For now, return unknown and show warning for all downloads
+        return "unknown"
+    else:
+        # Windows/Linux/Mac - assume WiFi/Ethernet (no warning needed)
+        return "wifi"
+
+
 class VoiceEngine:
     def __init__(self, stream_factory: Optional[Callable[[], Tuple[Optional[object], Optional[Callable[[], None]]]]] = None) -> None:
         self.listener: Optional[AudioListener] = None
@@ -885,11 +1502,22 @@ class VoiceEngine:
 
     def start(self, model_path: Optional[str], result_queue: queue.Queue) -> bool:
         if not model_path:
+            logger.error("Cannot start voice engine: No model path provided")
             return False
+        
+        logger.info("Starting voice engine...")
         if self.listener:
             return self.listener.start()
+        
         self.listener = AudioListener(model_path, result_queue, self.stream_factory)
-        return self.listener.start()
+        success = self.listener.start()
+        
+        if success:
+            logger.info("Voice engine started successfully")
+        else:
+            logger.error("Voice engine failed to start")
+        
+        return success
 
     def stop(self) -> None:
         if self.listener:
@@ -909,7 +1537,9 @@ class VoiceFirstApp(App):
         self.progress: Optional[ProgressStore] = None
         self.loader = VocabularyLoader()
         self.language_labels = self.loader.available_languages()
-        self.target_language = next(iter(self.language_labels)) if self.language_labels else "en"
+        self.config_store: Optional[JsonStore] = None
+        # Don't load language in __init__, do it in build() when user_data_dir is ready
+        self.target_language = "en" if "en" in self.language_labels else next(iter(self.language_labels))
         self.session: Optional[SessionState] = None
         self.audio_queue: queue.Queue = queue.Queue()
         if platform == "android":
@@ -922,8 +1552,57 @@ class VoiceFirstApp(App):
         self.manager = ScreenManager(transition=SlideTransition())
         self.model_registry: Dict[str, Any] = {"models": {}, "active_model": None}
         self._download_thread: Optional[threading.Thread] = None
+        self._initializing = True  # Flag to prevent saves during initialization
+    
+    def _load_last_language(self) -> str:
+        """Load the last selected language from config, or default to English."""
+        try:
+            config_path = os.path.join(self.user_data_dir, "config.json")
+            if os.path.exists(config_path):
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    last_lang = config.get('last_language')
+                    if last_lang and last_lang in self.language_labels:
+                        logger.info(f"Restored last language: {last_lang}")
+                        return last_lang
+        except Exception as e:
+            logger.warning(f"Could not load last language: {e}")
+        
+        # Default to English if available, otherwise first language
+        default = "en" if "en" in self.language_labels else (next(iter(self.language_labels)) if self.language_labels else "en")
+        logger.info(f"Using default language: {default}")
+        return default
+    
+    def _save_last_language(self, language: str) -> None:
+        """Save the selected language to config for next session."""
+        if self._initializing:
+            # Don't save during initialization
+            return
+        try:
+            config_path = os.path.join(self.user_data_dir, "config.json")
+            os.makedirs(os.path.dirname(config_path), exist_ok=True)
+            config = {'last_language': language}
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2)
+            logger.info(f"Saved language preference: {language}")
+        except Exception as e:
+            logger.warning(f"Could not save language preference: {e}")
 
     def build(self) -> ScreenManager:
+        # Register Noto Sans font for Unicode support
+        try:
+            font_path = os.path.join(os.path.dirname(__file__), 'NotoSans-Regular.ttf')
+            if os.path.exists(font_path):
+                LabelBase.register(name='NotoSans', fn_regular=font_path)
+                logger.info(f"Noto Sans font registered successfully from {font_path}")
+            else:
+                logger.warning(f"Noto Sans font not found at {font_path}")
+        except Exception as e:
+            logger.error(f"Failed to register Noto Sans font: {e}")
+        
+        # Load saved language preference now that user_data_dir is available
+        self.target_language = self._load_last_language()
+        
         storage_path = os.path.join(self.user_data_dir, "progress.json")
         self.progress = ProgressStore(storage_path)
         self.model_path = prepare_vosk_model(self)
@@ -954,14 +1633,17 @@ class VoiceFirstApp(App):
             self.target_language = next(iter(self.language_labels))
         Window.clearcolor = (0.08, 0.1, 0.18, 1)
         mode_screen = ModeSelectionScreen(name="mode", languages=self.language_labels)
+        language_screen = LanguageSelectionScreen(name="language", languages=self.language_labels)
         training_screen = TrainingScreen(name="training")
         dashboard_screen = DashboardScreen(name="dashboard")
         settings_screen = ModelSettingsScreen(name="settings")
         self.manager.add_widget(mode_screen)
+        self.manager.add_widget(language_screen)
         self.manager.add_widget(training_screen)
         self.manager.add_widget(dashboard_screen)
         self.manager.add_widget(settings_screen)
         self.update_language_ui()
+        self._initializing = False  # Initialization complete, allow saves
         return self.manager
 
     @property
@@ -975,6 +1657,10 @@ class VoiceFirstApp(App):
     @property
     def mode_screen(self) -> ModeSelectionScreen:
         return self.manager.get_screen("mode")  # type: ignore
+    
+    @property
+    def language_screen(self) -> LanguageSelectionScreen:
+        return self.manager.get_screen("language")  # type: ignore
 
     @property
     def settings_screen(self) -> ModelSettingsScreen:
@@ -1017,6 +1703,25 @@ class VoiceFirstApp(App):
         if not label:
             pretty = path.name.replace("_", " ").replace("-", " ")
             self.model_registry["models"][str(path)] = pretty.title()
+
+    def _extract_model_name_from_url(self, url: str) -> str:
+        """Extract the model name from a download URL."""
+        filename = url.split("/")[-1]
+        if filename.endswith(".zip"):
+            return filename[:-4]
+        return filename
+
+    def _is_model_cached(self, model_name: str) -> bool:
+        """Check if a model with the given name already exists in cache."""
+        models_dir = self._models_dir()
+        for entry in models_dir.iterdir():
+            if entry.is_dir() and entry.name == model_name:
+                return True
+        # Also check legacy location
+        legacy_dir = Path(self.user_data_dir) / model_name
+        if legacy_dir.is_dir():
+            return True
+        return False
 
     def list_vosk_models(self) -> List[Dict[str, str]]:
         models: List[Dict[str, str]] = []
@@ -1088,9 +1793,58 @@ class VoiceFirstApp(App):
             if not self.voice_engine.start(self.model_path, self.audio_queue):
                 self._notify_model_status("Speech engine unavailable with imported model")
 
+    def delete_model(self, path: str) -> bool:
+        """Delete a model from disk and update registry.
+        
+        Args:
+            path: Absolute path to the model directory
+            
+        Returns:
+            True if deletion was successful, False otherwise
+        """
+        try:
+            target = Path(path)
+            if not target.exists():
+                return False
+            
+            # Don't allow deleting the currently active model
+            if self.model_path and os.path.abspath(path) == os.path.abspath(self.model_path):
+                # Switch to another model if available
+                models = self.list_vosk_models()
+                for model in models:
+                    other_path = model.get("path")
+                    if other_path and os.path.abspath(other_path) != os.path.abspath(path):
+                        self.model_path = other_path
+                        self.model_registry["active_model"] = other_path
+                        break
+                else:
+                    # No other models available
+                    self.model_path = None
+                    self.model_registry["active_model"] = None
+                    self.voice_engine.stop()
+            
+            # Remove from registry
+            if str(target) in self.model_registry.get("models", {}):
+                del self.model_registry["models"][str(target)]
+            
+            # Delete the directory
+            if target.is_dir():
+                shutil.rmtree(target)
+            
+            self._save_model_registry()
+            return True
+        except Exception:
+            return False
+
     def queue_model_download(self, label: str, url: str) -> None:
         if self._download_thread and self._download_thread.is_alive():
             self._notify_model_status("Another download is already running")
+            return
+
+        # Check if model is already cached
+        model_name = self._extract_model_name_from_url(url)
+        if self._is_model_cached(model_name):
+            self._notify_model_status(f"{label} is already downloaded (cached)")
             return
 
         def _task() -> None:
@@ -1141,6 +1895,9 @@ class VoiceFirstApp(App):
 
     def show_mode_selection(self) -> None:
         self.manager.current = "mode"
+    
+    def show_language_selection(self) -> None:
+        self.manager.current = "language"
 
     def set_target_language(self, language: str) -> None:
         available = self.loader.available_languages()
@@ -1150,7 +1907,11 @@ class VoiceFirstApp(App):
             return
         self.language_labels = available
         self.target_language = language
+        self._save_last_language(language)
         self.update_language_ui()
+        
+        # Auto-switch to appropriate model for this language
+        self._switch_model_for_language(language)
 
     def refresh_languages(self) -> None:
         self.loader.refresh_external_sources()
@@ -1188,8 +1949,13 @@ class VoiceFirstApp(App):
         self.manager.current = "training"
         self.update_language_ui()
         self.prepare_next_word()
+        
+        logger.info(f"Starting training session - Mode: {mode}, Language: {self.target_language}")
         if not self.voice_engine.start(self.model_path, self.audio_queue):
-            self.training_screen.feedback_label.text = "Speech engine unavailable; using manual mode"
+            error_msg = "Speech engine unavailable; using manual mode"
+            logger.warning(error_msg)
+            logger.info("Check voicefirst_app.log for detailed error information")
+            self.training_screen.feedback_label.text = error_msg
 
     def prepare_next_word(self) -> None:
         if not self.session:
@@ -1222,6 +1988,27 @@ class VoiceFirstApp(App):
             )
         return state
 
+    def _switch_model_for_language(self, language: str) -> None:
+        """Automatically switch to or suggest downloading model for language."""
+        model_code = LANGUAGE_MODEL_MAP.get(language)
+        if not model_code:
+            logger.info(f"No model mapping found for language: {language}")
+            return
+        
+        # Check if we already have a suitable model downloaded
+        models = self.list_vosk_models()
+        for model in models:
+            model_path = model.get("path", "")
+            # Check if model path contains the language code (e.g., "vosk-model-small-nl")
+            if f"-{model_code}-" in model_path or model_path.endswith(f"-{model_code}"):
+                logger.info(f"Switching to model for {language}: {model_path}")
+                self.set_model_path(model_path)
+                return
+        
+        # No suitable model found - log that user should download one
+        logger.info(f"No {language} model found. User should download from Settings.")
+        # Could optionally show a popup suggesting to download the model
+    
     def show_dashboard(self) -> None:
         self.dashboard_screen.refresh()
         self.manager.current = "dashboard"
@@ -1230,7 +2017,12 @@ class VoiceFirstApp(App):
         self.voice_engine.stop()
 
     def transition_back(self) -> None:
-        self.manager.current = "training"
+        # If we have an active training session, go back to training
+        # Otherwise, go back to the mode selection screen
+        if self.session:
+            self.manager.current = "training"
+        else:
+            self.manager.current = "mode"
 
     def update_language_ui(self) -> None:
         label = self.loader.language_label(self.target_language)
@@ -1241,6 +2033,10 @@ class VoiceFirstApp(App):
         try:
             self.mode_screen.update_languages(self.language_labels)
             self.mode_screen.update_language_display(self.target_language)
+        except Exception:
+            pass
+        try:
+            self.language_screen.update_language_display(self.target_language)
         except Exception:
             pass
 
